@@ -141,6 +141,13 @@ Safe to ignore as long as you don’t add external pull-ups/downs.
 ![IMG20260217210120](https://github.com/user-attachments/assets/d941fe42-7c47-4634-8ca1-b6a0c3c1f4e7)
 
 
+## ✅ Tested with
+
+- ESPHome 2026.x
+- Home Assistant 2026.1.
+- Waveshare ESP32-S3 Touch LCD 4.3 (SKU 25948)
+
+
 
 
 
