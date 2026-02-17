@@ -1,0 +1,566 @@
+esphome:
+  name: waveshare-43-panel
+  friendly_name: Waveshare 4.3 Panel
+  on_boot:
+    priority: 200
+    then:
+      - lvgl.page.show: main_page
+      - script.execute: user_activity
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: your 32-character-api-encryption-key
+
+ota:
+  - platform: esphome
+    password: your-ota-password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# --- Fonts ---
+font:
+  - file: "gfonts://Montserrat"
+    id: font_header
+    size: 24
+  - file: "gfonts://Roboto"
+    id: font_normal
+    size: 18
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_tiny
+    size: 14
+
+# --- I2C Bus ---
+i2c:
+  sda: 8
+  scl: 9
+  scan: true
+  id: bus_a
+
+# =========================
+# BACKLIGHT (real ON/OFF via CH422G EXIO2)
+# =========================
+
+ch422g:
+  - id: exio
+    i2c_id: bus_a
+
+output:
+  - platform: gpio
+    id: backlight_en_out
+    pin:
+      ch422g: exio
+      number: 2
+
+light:
+  - platform: binary
+    name: "Display Backlight"
+    id: disp_backlight
+    output: backlight_en_out
+    restore_mode: ALWAYS_ON
+
+# =========================
+# DISPLAY
+# =========================
+display:
+  - platform: rpi_dpi_rgb
+    id: main_display
+    dimensions:
+      width: 800
+      height: 480
+    color_order: RGB
+    pclk_frequency: 14MHz
+    pclk_pin: 7
+    hsync_pin: 46
+    vsync_pin: 3
+    de_pin: 5
+    reset_pin:
+      ch422g: exio
+      number: 3
+    data_pins:
+      red: [1, 42, 41, 40, 39]
+      green: [0, 45, 48, 47, 21, 14]
+      blue: [38, 18, 17, 10, 11]
+    hsync_pulse_width: 10
+    hsync_back_porch: 10
+    hsync_front_porch: 20
+    vsync_pulse_width: 10
+    vsync_back_porch: 10
+    vsync_front_porch: 10
+
+# =========================
+# TOUCH (wake + reset timer)
+# =========================
+touchscreen:
+  - platform: gt911
+    id: touch_bus
+    display: main_display
+    i2c_id: bus_a
+    address: 0x5D
+    interrupt_pin: GPIO4
+    reset_pin:
+      ch422g: exio
+      number: 1
+    on_touch:
+      then:
+        - script.execute: user_activity
+
+# =========================
+# HOME ASSISTANT DATA
+# =========================
+time:
+  - platform: homeassistant
+    id: ha_time
+
+sensor:
+  - platform: homeassistant
+    id: room_temp
+    entity_id: sensor.p_j_bedroom_temp
+
+text_sensor:
+  - platform: homeassistant
+    id: blind_state
+    entity_id: cover.p_j_blind
+
+binary_sensor:
+  - platform: homeassistant
+    id: light_main_state
+    entity_id: light.p_j_bedroom_switch_right
+  - platform: homeassistant
+    id: light_josie_state
+    entity_id: light.josie_bed_light
+  - platform: homeassistant
+    id: light_peter_state
+    entity_id: light.peter_bed_light
+  - platform: homeassistant
+    id: light_bath_state
+    entity_id: light.p_j_bathroom
+  - platform: homeassistant
+    id: light_mirror_state
+    entity_id: light.p_j_bathroom_mirror_relay
+
+# =========================
+# IDLE / SLEEP LOGIC
+# =========================
+globals:
+  - id: last_touch_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: is_sleeping
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+script:
+  # called on boot + every touch
+  - id: user_activity
+    mode: restart
+    then:
+      - lambda: |-
+          id(last_touch_ms) = millis();
+      - if:
+          condition:
+            lambda: 'return id(is_sleeping);'
+          then:
+            - lambda: 'id(is_sleeping) = false;'
+            - light.turn_on: disp_backlight
+            - lvgl.page.show: wake_page
+            - delay: 500ms
+            - lvgl.page.show: main_page
+          else:
+            - light.turn_on: disp_backlight
+            - lvgl.page.show: main_page
+
+  - id: go_to_sleep
+    mode: restart
+    then:
+      - lambda: 'id(is_sleeping) = true;'
+      - lvgl.page.show: wake_page
+      - light.turn_off: disp_backlight
+interval:
+  # UI updates (only when awake)
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(is_sleeping);'
+          then:
+            - lvgl.label.update:
+                id: time_label
+                text: !lambda |-
+                  auto now = id(ha_time).now();
+                  return now.is_valid() ? now.strftime("%H:%M") : "--:--";
+
+            - lvgl.label.update:
+                id: temp_label
+                text: !lambda |-
+                  float t = id(room_temp).state;
+                  char buf[64];
+                  if (isnan(t)) {
+                    snprintf(buf, sizeof(buf), "Room Status\nPresence: NO\n--.- C");
+                  } else {
+                    snprintf(buf, sizeof(buf), "Room Status\nPresence: NO\n%.1f C", t);
+                  }
+                  return std::string(buf);
+
+            - lvgl.label.update:
+                id: blind_status_label
+                text: !lambda |-
+                  return std::string("State: ") + id(blind_state).state;
+
+            # ON = lighter grey, OFF = dark grey
+            - lvgl.widget.update:
+                id: btn_main
+                bg_color: !lambda "return id(light_main_state).state ? lv_color_hex(0x3A3A3A) : lv_color_hex(0x141414);"
+            - lvgl.widget.update:
+                id: btn_josie
+                bg_color: !lambda "return id(light_josie_state).state ? lv_color_hex(0x3A3A3A) : lv_color_hex(0x141414);"
+            - lvgl.widget.update:
+                id: btn_peter
+                bg_color: !lambda "return id(light_peter_state).state ? lv_color_hex(0x3A3A3A) : lv_color_hex(0x141414);"
+            - lvgl.widget.update:
+                id: btn_bath
+                bg_color: !lambda "return id(light_bath_state).state ? lv_color_hex(0x3A3A3A) : lv_color_hex(0x141414);"
+            - lvgl.widget.update:
+                id: btn_mirror
+                bg_color: !lambda "return id(light_mirror_state).state ? lv_color_hex(0x3A3A3A) : lv_color_hex(0x141414);"
+
+  # sleep timer check (30 seconds)
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(is_sleeping)) return false;
+              uint32_t elapsed = millis() - id(last_touch_ms);
+              return elapsed > 30000;
+          then:
+            - script.execute: go_to_sleep
+
+# =========================
+# LVGL UI
+# =========================
+lvgl:
+  log_level: WARN
+  buffer_size: 25%
+
+  pages:
+
+    # =========================
+    # WAKE PAGE (blank, blocks accidental presses)
+    # =========================
+    - id: wake_page
+      bg_color: 0x000000
+      pad_all: 0
+      widgets: []
+
+    # =========================
+    # MAIN PAGE
+    # =========================
+    - id: main_page
+      bg_color: 0x000000
+      pad_all: 12
+      layout:
+        type: grid
+        grid_columns: [540, 240]
+        grid_rows: [74, 382]
+        pad_column: 10
+        pad_row: 10
+
+      widgets:
+
+        # HEADER BAR
+        - obj:
+            id: header_bar
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 0
+            width: 790
+            height: 74
+            radius: 16
+            bg_color: 0x0A0A0A
+            border_color: 0x4A4A4A
+            border_width: 2
+            pad_left: 16
+            pad_right: 16
+            layout:
+              type: flex
+              flex_flow: ROW
+              flex_align_main: SPACE_BETWEEN
+              flex_align_cross: CENTER
+            widgets:
+              - label:
+                  text: "P & J Bedroom"
+                  text_font: font_header
+                  text_color: 0xEDEDED
+              - label:
+                  id: time_label
+                  text: "--:--"
+                  text_font: font_header
+                  text_color: 0xEDEDED
+
+        # LEFT PANEL
+        - obj:
+            id: left_panel
+            grid_cell_column_pos: 0
+            grid_cell_row_pos: 1
+            width: 540
+            height: 382
+            radius: 18
+            bg_color: 0x070707
+            border_color: 0x4A4A4A
+            border_width: 2
+            pad_all: 10
+            layout:
+              type: grid
+              grid_columns: [168, 168, 168]
+              grid_rows: [160, 160]
+              pad_column: 10
+              pad_row: 10
+            widgets:
+              - button:
+                  id: btn_josie
+                  grid_cell_column_pos: 0
+                  grid_cell_row_pos: 0
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        text: "Josie Lamp"
+                        text_font: font_normal
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+                  on_press:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: "light.josie_bed_light"
+
+              - button:
+                  id: btn_peter
+                  grid_cell_column_pos: 1
+                  grid_cell_row_pos: 0
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        text: "Peter Lamp"
+                        text_font: font_normal
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+                  on_press:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: "light.peter_bed_light"
+
+              - button:
+                  id: btn_main
+                  grid_cell_column_pos: 2
+                  grid_cell_row_pos: 0
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        text: "Bedroom Light"
+                        text_font: font_normal
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+                  on_press:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: "light.p_j_bedroom_switch_right"
+
+              - button:
+                  id: btn_bath
+                  grid_cell_column_pos: 0
+                  grid_cell_row_pos: 1
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        text: "Bathroom Light"
+                        text_font: font_normal
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+                  on_press:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: "light.p_j_bathroom"
+
+              - button:
+                  id: btn_mirror
+                  grid_cell_column_pos: 1
+                  grid_cell_row_pos: 1
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        text: "Mirror Light"
+                        text_font: font_normal
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+                  on_press:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: "light.p_j_bathroom_mirror_relay"
+
+              - obj:
+                  id: room_status_tile
+                  grid_cell_column_pos: 2
+                  grid_cell_row_pos: 1
+                  width: 168
+                  height: 160
+                  radius: 16
+                  bg_color: 0x101010
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  pad_all: 12
+                  widgets:
+                    - label:
+                        id: temp_label
+                        text: "Room Status\nPresence: NO\n--.- C"
+                        text_font: font_small
+                        text_color: 0xEDEDED
+                        align: TOP_LEFT
+
+        # RIGHT PANEL
+        - obj:
+            id: right_panel
+            grid_cell_column_pos: 1
+            grid_cell_row_pos: 1
+            width: 240
+            height: 382
+            radius: 18
+            bg_color: 0x070707
+            border_color: 0x4A4A4A
+            border_width: 2
+            pad_all: 12
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              - label:
+                  text: "Blinds"
+                  text_font: font_header
+                  text_color: 0xEDEDED
+              - label:
+                  id: blind_status_label
+                  text: "State: unknown"
+                  text_font: font_normal
+                  text_color: 0xEDEDED
+
+              - button:
+                  width: 216
+                  height: 88
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  widgets:
+                    - label:
+                        text: "Up"
+                        text_font: font_header
+                        text_color: 0xEDEDED
+                  on_press:
+                    - homeassistant.service:
+                        service: cover.open_cover
+                        data:
+                          entity_id: "cover.p_j_blind"
+
+              - button:
+                  width: 216
+                  height: 88
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  widgets:
+                    - label:
+                        text: "Stop"
+                        text_font: font_header
+                        text_color: 0xEDEDED
+                  on_press:
+                    - homeassistant.service:
+                        service: cover.stop_cover
+                        data:
+                          entity_id: "cover.p_j_blind"
+
+              - button:
+                  width: 216
+                  height: 88
+                  radius: 16
+                  bg_color: 0x141414
+                  border_color: 0x4A4A4A
+                  border_width: 2
+                  widgets:
+                    - label:
+                        text: "Down"
+                        text_font: font_header
+                        text_color: 0xEDEDED
+                  on_press:
+                    - homeassistant.service:
+                        service: cover.close_cover
+                        data:
+                          entity_id: "cover.p_j_blind"
+
+    # =========================
+    # SLEEP PAGE
+    # =========================
+    - id: sleep_page
+      bg_color: 0x000000
+      widgets:
+        - label:
+            text: "Tap to wake"
+            text_font: font_tiny
+            text_color: 0x202020
+            align: CENTER
+
